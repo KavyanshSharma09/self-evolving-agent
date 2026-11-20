@@ -1,5 +1,4 @@
 import os
-from django.core.checks import messages
 from dotenv import load_dotenv
 import openai
 from openai.types.chat import ChatCompletionMessageParam

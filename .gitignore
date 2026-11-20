@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment variables and secrets
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Junie session artifacts (plans and guidelines are kept)
+.june/sessions/
+.junie/agents/
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Generated tool artifacts during development
+tools_created_by_model/
