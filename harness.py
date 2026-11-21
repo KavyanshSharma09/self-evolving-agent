@@ -14,7 +14,7 @@ import shutil
 import sys
 import tempfile
 import datetime
-from sandbox import run_tool
+from sandbox import run_tool, run_raw
 
 # Directory where all tools reside
 TOOLS_DIR = pathlib.Path(__file__).parent / "tools"
@@ -305,6 +305,49 @@ def describe() -> str:
     return "\n".join(lines)
 
 
+def list_available_tools() -> list:
+    """Return a structured list of all available tools: core tools + installed capabilities.
+    Each entry contains name, type (core/capability), version, description, and input_schema."""
+    result = []
+    # Core tools — always available
+    core_tools = [
+        {"name": "ws_write", "type": "core", "version": "built-in",
+         "description": "Write content to a file in the workspace.",
+         "input_schema": {"path": "string", "content": "string"}},
+        {"name": "ws_list", "type": "core", "version": "built-in",
+         "description": "List files in a workspace directory.",
+         "input_schema": {"path": "string (optional)"}},
+        {"name": "search_capabilities", "type": "core", "version": "built-in",
+         "description": "Search for installed tools by keyword.",
+         "input_schema": {"query": "string", "limit": "int (default 5)"}},
+        {"name": "submit_tool", "type": "core", "version": "built-in",
+         "description": "Submit a new or updated tool for validation and installation.",
+         "input_schema": {"manifest": "object", "code": "string"}},
+        {"name": "rollback_tool", "type": "core", "version": "built-in",
+         "description": "Roll back a tool to a previous healthy version.",
+         "input_schema": {"name": "string", "version": "string (optional)"}},
+        {"name": "run_code", "type": "core", "version": "built-in",
+         "description": "Run a Python snippet in the sandbox (always-available fallback).",
+         "input_schema": {"code": "string", "timeout": "float (default 10)"}},
+        {"name": "list_available_tools", "type": "core", "version": "built-in",
+         "description": "List all available tools (core + installed capabilities) as JSON.",
+         "input_schema": {}},
+    ]
+    result.extend(core_tools)
+    # Installed capabilities from registry
+    registry = load_registry()
+    tools = _scan_versioned(registry)
+    for name, m in tools.items():
+        result.append({
+            "name": name,
+            "type": "capability",
+            "version": m.get("_version", "unknown"),
+            "description": m.get("description", ""),
+            "input_schema": m.get("input_schema", {}),
+        })
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Workspace core tools
 # ---------------------------------------------------------------------------
@@ -341,13 +384,14 @@ def _ws_list(path: str = "") -> dict:
 # ---------------------------------------------------------------------------
 
 def _run_code(code: str, timeout: float = 10.0) -> dict:
-    """Run a Python snippet in the sandbox with workspace as cwd."""
+    """Run a Python snippet in the sandbox with workspace as cwd.
+    Uses run_raw so plain print() output works, not just JSON."""
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
     tmp_dir = pathlib.Path(tempfile.mkdtemp())
     script = tmp_dir / "snippet.py"
     script.write_text(code, encoding="utf-8")
     try:
-        result = run_tool(str(script), {}, timeout=timeout, cwd=str(WORKSPACE_DIR))
+        result = run_raw(str(script), timeout=timeout, cwd=str(WORKSPACE_DIR))
         return result
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -413,16 +457,12 @@ def call_tool(name: str, args: dict) -> dict:
         return {"error": "no_entry", "detail": f"Tool '{name}' has no entry point"}
 
     # Validate input against input_schema (bad input doesn't count against health)
-    input_schema = manifest.get("input_schema", {})
-    if input_schema and args:
-        try:
-            from jsonschema import validate, ValidationError
-            validate(instance=args, schema=input_schema)
-        except (ValidationError, ImportError):
-            pass  # jsonschema may not be installed; skip validation
+    err = _schema_error(args, manifest.get("input_schema", {}))
+    if err:
+        return {"error": "invalid_input", "detail": err}
 
     active_version = manifest.get("_version", "")
-    result = run_tool(entry_path, args)
+    result = run_tool(entry_path, args, cwd=str(WORKSPACE_DIR))
 
     if result["ok"]:
         output = result["output"]
@@ -433,19 +473,11 @@ def call_tool(name: str, args: dict) -> dict:
             save_registry(registry)
             return {"result": output}
         # Validate output against output_schema
-        output_schema = manifest.get("output_schema", {})
-        output_valid = True
-        if output_schema:
-            try:
-                from jsonschema import validate, ValidationError
-                validate(instance=output, schema=output_schema)
-            except (ValidationError, ImportError):
-                output_valid = False
-        if not output_valid:
-            # Output schema violation counts as failure
+        err = _schema_error(output, manifest.get("output_schema", {}))
+        if err:
             _record_failure(registry, name, active_version)
             save_registry(registry)
-            return {"error": "invalid_output", "detail": "Output does not match output_schema"}
+            return {"error": "invalid_output", "detail": f"Output does not match output_schema: {err}"}
         # Success
         _update_stats(registry, name, success=True)
         save_registry(registry)
@@ -515,7 +547,7 @@ def _try_fallback(registry: dict, name: str, args: dict) -> dict:
         entry_path = ver_dir / "main.py"
         if not entry_path.is_file():
             continue
-        result = run_tool(str(entry_path), args)
+        result = run_tool(str(entry_path), args, cwd=str(WORKSPACE_DIR))
         if result["ok"]:
             # Fallback succeeded — make it active
             entry["active"] = ver
@@ -589,6 +621,30 @@ def _resolve_refs(value, input_data, step_results):
 # Validation pipeline — 6 stages
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# JSON Schema validation helpers — safe import to avoid UnboundLocalError
+# ---------------------------------------------------------------------------
+
+try:
+    from jsonschema import validate as _js_validate, ValidationError as _JSError, Draft7Validator, SchemaError
+except ImportError:
+    _js_validate, _JSError = None, Exception
+    Draft7Validator, SchemaError = None, None
+
+
+def _schema_error(instance, schema):
+    """Return an error message if instance violates schema, else None."""
+    if not schema or _js_validate is None:
+        return None
+    try:
+        _js_validate(instance=instance, schema=schema)
+    except _JSError as e:
+        return e.message
+    except Exception:
+        return None  # malformed schema: skip rather than crash
+    return None
+
+
 # Known stdlib modules (Python 3.12) — allow these without permission
 _STDLIB_MODULES = set(sys.stdlib_module_names) if hasattr(sys, "stdlib_module_names") else {
     "json", "sys", "os", "pathlib", "re", "math", "datetime", "collections",
@@ -625,6 +681,23 @@ def _validate_manifest(manifest: dict, registry: dict) -> dict:
             details.append("Missing input_schema")
         if "output_schema" not in manifest:
             details.append("Missing output_schema")
+        # Validate that schemas are proper JSON Schema
+        for key in ("input_schema", "output_schema"):
+            schema = manifest.get(key)
+            if schema is None:
+                continue
+            if Draft7Validator is not None:
+                try:
+                    Draft7Validator.check_schema(schema)
+                except SchemaError as e:
+                    details.append(f"{key} is not a valid JSON Schema: {e.message}")
+                    continue
+            if "type" not in schema:
+                details.append(f'{key} needs a "type" (input_schema: "object" with "properties")')
+        # Require input_schema to be {"type": "object", "properties": {...}, "required": [...]}
+        ins = manifest.get("input_schema")
+        if isinstance(ins, dict) and not (ins.get("type") == "object" and isinstance(ins.get("properties"), dict)):
+            details.append('input_schema must look like {"type": "object", "properties": {...}, "required": [...]}')
     examples = manifest.get("examples", [])
     if not is_workflow:
         if not examples:
@@ -632,14 +705,20 @@ def _validate_manifest(manifest: dict, registry: dict) -> dict:
         elif len(examples) > 20:
             details.append("At most 20 examples allowed")
         else:
-            # Validate examples against schemas
-            input_schema = manifest.get("input_schema", {})
-            output_schema = manifest.get("output_schema", {})
             for i, ex in enumerate(examples):
                 if "input" not in ex:
                     details.append(f"Example {i}: missing 'input'")
                 if "output" not in ex:
                     details.append(f"Example {i}: missing 'output'")
+                # Validate examples against schemas
+                if "input" in ex:
+                    err = _schema_error(ex["input"], manifest.get("input_schema", {}))
+                    if err:
+                        details.append(f"Example {i} input violates input_schema: {err}")
+                if "output" in ex:
+                    err = _schema_error(ex["output"], manifest.get("output_schema", {}))
+                    if err:
+                        details.append(f"Example {i} output violates output_schema: {err}")
 
     if "permissions" not in manifest:
         manifest["permissions"] = {}
@@ -958,6 +1037,8 @@ def execute(name: str, args: dict) -> dict:
             return _rollback_tool(args.get("name", ""), args.get("version"))
         elif name == "run_code":
             return _run_code(args.get("code", ""), args.get("timeout", 10.0))
+        elif name == "list_available_tools":
+            return {"result": list_available_tools()}
         else:
             # Try as a regular tool
             return call_tool(name, args)

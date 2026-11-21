@@ -232,6 +232,22 @@ python eval.py
 5. **Harness interface doesn't change** — new tools don't require harness modifications
 6. **No `ws_read` core tool** — the agent must create its own file-reading tool
 
+## Security Notes
+
+### Workspace Confinement
+
+All tools and `run_code` snippets are **confined to the workspace directory**. The
+sandbox wrapper intercepts `open()`, `os.open()`, and `pathlib.Path` file operations,
+raising `PermissionError` if any path resolves outside the workspace. This prevents
+tools from reading sensitive files like `.env` or system files.
+
+### Subprocess Sandbox
+
+The plain `subprocess.run()` sandbox is **defense-in-depth**, not a real security
+boundary. It provides timeout protection, process isolation, and workspace confinement,
+but does not prevent network access or other system calls. For stronger isolation,
+the optional Docker backend can be implemented.
+
 ## License
 
 This project is provided as-is for educational and research purposes.

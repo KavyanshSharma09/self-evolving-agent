@@ -433,8 +433,8 @@ class TestSubmitTool:
             "name": "drytool",
             "version": "1.0.0",
             "description": "Dry run test tool description",
-            "input_schema": {"type": "object"},
-            "output_schema": {"type": "object"},
+            "input_schema": {"type": "object", "properties": {}},
+            "output_schema": {"type": "object", "properties": {"ok": {"type": "boolean"}}},
             "examples": [{"input": {}, "output": {"ok": True}}],
             "permissions": {},
         }
@@ -538,14 +538,15 @@ class TestVersionImmutability:
             "name": "multiver",
             "version": "1.0.0",
             "description": "Multi version tool description",
-            "input_schema": {"type": "object"},
-            "output_schema": {"type": "object"},
+            "input_schema": {"type": "object", "properties": {}},
+            "output_schema": {"type": "object", "properties": {"v": {"type": "integer"}}},
             "examples": [{"input": {}, "output": {"v": 1}}],
             "permissions": {},
         }
         harness.submit_tool(manifest, "import sys, json; print(json.dumps({'v': 1}))")
         manifest["version"] = "2.0.0"
         manifest["description"] = "Multi version tool v2 description"
+        manifest["output_schema"] = {"type": "object", "properties": {"v": {"type": "integer"}}}
         manifest["examples"] = [{"input": {}, "output": {"v": 2}}]
         harness.submit_tool(manifest, "import sys, json; print(json.dumps({'v': 2}))")
 

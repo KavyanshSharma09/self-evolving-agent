@@ -42,3 +42,6 @@ htmlcov/
 
 # Generated tool artifacts during development
 tools_created_by_model/
+
+# Runtime registry (regenerated on first load)
+tools/registry.json

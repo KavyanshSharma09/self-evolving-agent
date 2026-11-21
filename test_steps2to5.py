@@ -68,8 +68,8 @@ class TestValidationPipeline:
             "name": "nettool",
             "version": "1.0.0",
             "description": "Network tool description",
-            "input_schema": {"type": "object"},
-            "output_schema": {"type": "object"},
+            "input_schema": {"type": "object", "properties": {}},
+            "output_schema": {"type": "object", "properties": {"ok": {"type": "boolean"}}},
             "examples": [{"input": {}, "output": {"ok": True}}],
             "permissions": {},
         }
@@ -84,8 +84,8 @@ class TestValidationPipeline:
             "name": "nettool2",
             "version": "1.0.0",
             "description": "Network tool with permission",
-            "input_schema": {"type": "object"},
-            "output_schema": {"type": "object"},
+            "input_schema": {"type": "object", "properties": {}},
+            "output_schema": {"type": "object", "properties": {"ok": {"type": "boolean"}}},
             "examples": [{"input": {}, "output": {"ok": True}}],
             "permissions": {"network": True},
         }
@@ -101,8 +101,8 @@ class TestValidationPipeline:
             "name": "badex",
             "version": "1.0.0",
             "description": "Bad example tool description",
-            "input_schema": {"type": "object"},
-            "output_schema": {"type": "object"},
+            "input_schema": {"type": "object", "properties": {"a": {"type": "integer"}}},
+            "output_schema": {"type": "object", "properties": {"result": {"type": "integer"}}},
             "examples": [{"input": {"a": 1}, "output": {"result": 999}}],
             "permissions": {},
         }
@@ -152,8 +152,8 @@ class TestValidationPipeline:
             "name": "add",
             "version": "1.1.0",
             "description": "Adds two numbers broken",
-            "input_schema": {"type": "object"},
-            "output_schema": {"type": "object"},
+            "input_schema": {"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}},
+            "output_schema": {"type": "object", "properties": {"result": {"type": "number"}}},
             "examples": [{"input": {"a": 1, "b": 2}, "output": {"result": 100}}],
             "permissions": {},
         }
@@ -170,8 +170,8 @@ class TestValidationPipeline:
             "name": "add",
             "version": "2.0.0",
             "description": "Adds two numbers v2",
-            "input_schema": {"type": "object"},
-            "output_schema": {"type": "object"},
+            "input_schema": {"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}},
+            "output_schema": {"type": "object", "properties": {"result": {"type": "number"}}},
             "examples": [{"input": {"a": 1, "b": 2}, "output": {"result": 3}}],
             "permissions": {"network": True},
         }
@@ -274,9 +274,9 @@ class TestHealthTracking:
         manifest = {
             "name": "errtool",
             "version": "1.0.0",
-            "description": "Error reporting tool",
-            "input_schema": {"type": "object"},
-            "output_schema": {"type": "object"},
+            "description": "Error reporting tool desc",
+            "input_schema": {"type": "object", "properties": {}},
+            "output_schema": {"type": "object", "properties": {"error": {"type": "string"}}},
             "examples": [{"input": {}, "output": {"error": "test"}}],
             "permissions": {},
         }
