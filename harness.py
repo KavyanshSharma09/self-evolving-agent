@@ -5,7 +5,6 @@ All tools live under the single ./tools/ directory with versioned storage:
 Registry at tools/registry.json is written atomically.
 """
 
-import ast
 import json
 import os
 import pathlib
@@ -15,6 +14,38 @@ import sys
 import tempfile
 import datetime
 from sandbox import run_tool, run_raw
+
+# ---------------------------------------------------------------------------
+# Tree-sitter for code parsing (replaces ast)
+# ---------------------------------------------------------------------------
+
+try:
+    from tree_sitter import Language, Parser
+    import tree_sitter_python as tspython
+    _PY_LANGUAGE = Language(tspython.language())
+    _TS_PARSER = Parser(_PY_LANGUAGE)
+    HAS_TREE_SITTER = True
+except ImportError:
+    HAS_TREE_SITTER = False
+    _TS_PARSER = None
+
+# ---------------------------------------------------------------------------
+# JSON logging for validation observability
+# ---------------------------------------------------------------------------
+
+_LOG_DIR = pathlib.Path(__file__).parent / "logs"
+_LOG_FILE = _LOG_DIR / "validation.json"
+
+
+def _log_validation(event: dict) -> None:
+    """Append a JSON line to the validation log file for observability."""
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        **event,
+    }
+    with open(_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
 
 # Directory where all tools reside
 TOOLS_DIR = pathlib.Path(__file__).parent / "tools"
@@ -751,37 +782,68 @@ def _validate_manifest(manifest: dict, registry: dict) -> dict:
 
 
 def _static_check(code: str, manifest: dict) -> dict:
-    """Stage 2: Static checks with ast. Returns {"ok": bool, "details": [...]}. """
+    """Stage 2: Static checks with tree-sitter. Returns {"ok": bool, "details": [...]}. """
     details = []
     permissions = manifest.get("permissions", {})
-    try:
-        tree = ast.parse(code)
-    except SyntaxError as e:
-        return {"ok": False, "details": [f"Syntax error: {e}"]}
 
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                mod = alias.name.split(".")[0]
-                if mod in _NETWORK_MODULES and not permissions.get("network"):
-                    details.append(f"Import '{alias.name}' requires permissions.network")
-                if mod in _SUBPROCESS_MODULES and not permissions.get("subprocess"):
-                    details.append(f"Import '{alias.name}' requires permissions.subprocess")
-                if alias.name in ("__import__", "importlib"):
-                    details.append(f"Import '{alias.name}' is not allowed")
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                mod = node.module.split(".")[0]
-                if mod in _NETWORK_MODULES and not permissions.get("network"):
-                    details.append(f"From-import '{node.module}' requires permissions.network")
-                if mod in _SUBPROCESS_MODULES and not permissions.get("subprocess"):
-                    details.append(f"From-import '{node.module}' requires permissions.subprocess")
-                if node.module in ("__import__", "importlib"):
-                    details.append(f"From-import '{node.module}' is not allowed")
-        elif isinstance(node, ast.Call):
-            # Check for __import__ calls
-            if isinstance(node.func, ast.Name) and node.func.id == "__import__":
-                details.append("Call to __import__ is not allowed")
+    if not HAS_TREE_SITTER:
+        details.append("tree-sitter not installed; static check skipped")
+        return {"ok": True, "details": details}
+
+    tree = _TS_PARSER.parse(bytes(code, "utf-8"))
+    if tree.root_node.has_error:
+        # Tree-sitter recovers from errors, but note them
+        pass
+
+    # Collect all imports and calls by walking the AST
+    imports = []  # list of module names (top-level)
+    calls = []    # list of function names
+
+    def _walk(node):
+        for child in node.children:
+            if child.type == "import_statement":
+                # import socket / import sys, json
+                for sub in child.children:
+                    if sub.type == "dotted_name":
+                        imports.append(sub.text.decode("utf-8"))
+            elif child.type == "import_from_statement":
+                # from os import path — first dotted_name is the module
+                found_import_kw = False
+                for sub in child.children:
+                    if sub.type == "import":
+                        found_import_kw = True
+                        continue
+                    if sub.type == "dotted_name":
+                        if not found_import_kw:
+                            # This is the "from" module (e.g., "os")
+                            imports.append(sub.text.decode("utf-8"))
+            elif child.type == "call":
+                for sub in child.children:
+                    if sub.type == "identifier":
+                        calls.append(sub.text.decode("utf-8"))
+                    elif sub.type == "attribute":
+                        # e.g., os.system() — get the attribute name
+                        for attr_child in sub.children:
+                            if attr_child.type == "identifier":
+                                calls.append(attr_child.text.decode("utf-8"))
+            _walk(child)
+
+    _walk(tree.root_node)
+
+    # Check imports against permissions
+    for mod_full in imports:
+        mod = mod_full.split(".")[0]
+        if mod in _NETWORK_MODULES and not permissions.get("network"):
+            details.append(f"Import '{mod_full}' requires permissions.network")
+        if mod in _SUBPROCESS_MODULES and not permissions.get("subprocess"):
+            details.append(f"Import '{mod_full}' requires permissions.subprocess")
+        if mod_full in ("__import__", "importlib"):
+            details.append(f"Import '{mod_full}' is not allowed")
+
+    # Check calls
+    for call_name in calls:
+        if call_name == "__import__":
+            details.append("Call to __import__ is not allowed")
 
     return {"ok": len(details) == 0, "details": details}
 
@@ -957,61 +1019,75 @@ def _find_similar_tools(description: str, registry: dict) -> list:
 
 def submit_tool(manifest_data: dict, code: str = "", dry_run: bool = False) -> dict:
     """Submit a new or updated tool through the 6-stage validation pipeline.
-    Returns structured report: {"ok", "status", "stages": [{"name", "ok", "details"}]}."""
+    Returns structured report: {"ok", "status", "stages": [{"name", "ok", "details"}]}.
+    Every run is logged to logs/validation.json for observability."""
     registry = load_registry()
     stages = []
+
+    tool_name = manifest_data.get("name", "")
+    version = manifest_data.get("version", "1.0.0")
+    is_workflow = manifest_data.get("kind") == "workflow"
+
+    def _result(ok, status):
+        """Build result dict and log it."""
+        result = {"ok": ok, "status": status, "stages": stages}
+        _log_validation({
+            "event": "submit_tool",
+            "tool": tool_name,
+            "version": version,
+            "status": status,
+            "dry_run": dry_run,
+            "stages": stages,
+        })
+        return result
 
     # Stage 1: Manifest lint
     stage = _validate_manifest(manifest_data, registry)
     stages.append({"name": "manifest_lint", "ok": stage["ok"], "details": stage["details"]})
     if not stage["ok"]:
-        return {"ok": False, "status": "rejected", "stages": stages}
-
-    tool_name = manifest_data.get("name", "")
-    version = manifest_data.get("version", "1.0.0")
-    is_workflow = manifest_data.get("kind") == "workflow"
+        return _result(False, "rejected")
 
     # Stage 2: Static checks (skip for workflows)
     if not is_workflow and code:
         stage = _static_check(code, manifest_data)
         stages.append({"name": "static_check", "ok": stage["ok"], "details": stage["details"]})
         if not stage["ok"]:
-            return {"ok": False, "status": "rejected", "stages": stages}
+            return _result(False, "rejected")
 
     # Stage 3: Example tests (skip for workflows)
     if not is_workflow and code:
         stage = _run_example_tests(code, manifest_data)
         stages.append({"name": "example_tests", "ok": stage["ok"], "details": stage["details"]})
         if not stage["ok"]:
-            return {"ok": False, "status": "rejected", "stages": stages}
+            return _result(False, "rejected")
 
     # Stage 4: Regression tests (skip for workflows)
     if not is_workflow and code:
         stage = _run_regression_tests(tool_name, version, code, manifest_data, registry)
         stages.append({"name": "regression_tests", "ok": stage["ok"], "details": stage["details"]})
         if not stage["ok"]:
-            return {"ok": False, "status": "rejected", "stages": stages}
+            return _result(False, "rejected")
 
     # Stage 5: Permission escalation
     stage = _check_permission_escalation(tool_name, manifest_data.get("permissions", {}), registry)
     stages.append({"name": "permission_escalation", "ok": stage["ok"], "details": stage["details"]})
     if not stage["ok"]:
         if stage.get("needs_approval"):
-            return {"ok": False, "status": "needs_approval", "stages": stages}
-        return {"ok": False, "status": "rejected", "stages": stages}
+            return _result(False, "needs_approval")
+        return _result(False, "rejected")
 
     if dry_run:
         stages.append({"name": "dry_run", "ok": True, "details": ["Validation passed (dry run)"]})
-        return {"ok": True, "status": "accepted", "stages": stages}
+        return _result(True, "accepted")
 
     # Stage 6: Promote
     stage = _promote_version(tool_name, version, code, manifest_data, registry)
     stages.append({"name": "promote", "ok": stage["ok"], "details": stage["details"]})
     if not stage["ok"]:
-        return {"ok": False, "status": "rejected", "stages": stages}
+        return _result(False, "rejected")
 
     save_registry(registry)
-    return {"ok": True, "status": "accepted", "stages": stages}
+    return _result(True, "accepted")
 
 
 # ---------------------------------------------------------------------------

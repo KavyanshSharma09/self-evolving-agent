@@ -36,7 +36,7 @@ Three independent blocks, loosely coupled:
 ### Step 2: 6-Stage Validation Pipeline
 Every submitted tool passes through:
 1. **Manifest Lint** — required fields, semver, JSON Schema validation
-2. **Static Checks** — AST-based import analysis against declared permissions
+2. **Static Checks** — tree-sitter-based code parsing for import/call analysis against declared permissions
 3. **Example Tests** — sandbox execution + determinism check
 4. **Regression Tests** — backward compatibility for same-MAJOR versions
 5. **Permission Escalation** — blocks new permissions without approval
@@ -77,7 +77,7 @@ python -m venv .venv
 .venv\Scripts\activate
 
 # Install dependencies
-pip install openai python-dotenv jsonschema pytest
+pip install openai python-dotenv jsonschema pytest tree-sitter tree-sitter-python
 ```
 
 ### Configuration
@@ -109,6 +109,8 @@ self-evolving-agent/
 ├── protocol.py             # JSON protocol parser and system prompt builder
 ├── response.py             # LLM client (OpenAI-compatible)
 ├── eval.py                 # Evaluation script with ~10 tasks
+├── logs/                   # Validation logs (JSON lines, auto-generated)
+│   └── validation.json     # Every submit_tool run with stages and outcomes
 ├── run_agent_dynamic.py    # Entry point for running the agent
 ├── capability_registry.py  # (Deprecated) absorbed into harness.py
 ├── tools/
@@ -222,6 +224,26 @@ python eval.py
 - Rejected submissions
 - Fallbacks triggered
 - **Reuse rate** — how often the agent reuses instead of recreating
+
+## Validation Logging
+
+Every `submit_tool` call is automatically logged to `logs/validation.json` as JSON lines
+(one JSON object per line). Each entry contains:
+
+- **timestamp** — when the validation ran (UTC)
+- **tool** — tool name
+- **version** — submitted version
+- **status** — `accepted`, `rejected`, or `needs_approval`
+- **dry_run** — whether this was a dry run
+- **stages** — all 6 validation stages with their pass/fail status and details
+
+This makes it easy to audit why a tool was rejected, track validation trends, and debug
+agent behavior. The log directory is excluded from git (`.gitignore`).
+
+```bash
+# View recent validation logs
+tail -n 20 logs/validation.json | python -m json.tool
+```
 
 ## Design Principles
 

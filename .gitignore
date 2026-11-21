@@ -45,3 +45,6 @@ tools_created_by_model/
 
 # Runtime registry (regenerated on first load)
 tools/registry.json
+
+# Validation logs (observability)
+logs/
