@@ -627,7 +627,7 @@ def execute_workflow(workflow_manifest: dict, input_data: dict) -> dict:
 
 
 def _resolve_refs(value, input_data, step_results):
-    """Recursively resolve $input.<field> and $steps.<id>.<field> references."""
+    """Recursively resolve $input.<field> and $steps.<id> / $steps.<id>.<field> references."""
     if isinstance(value, str):
         if value.startswith("$input."):
             field = value[len("$input."):]
@@ -636,10 +636,15 @@ def _resolve_refs(value, input_data, step_results):
             rest = value[len("$steps."):]
             dot_idx = rest.find(".")
             if dot_idx != -1:
+                # $steps.<id>.<field> — resolve a specific field
                 step_id = rest[:dot_idx]
                 field = rest[dot_idx + 1:]
                 step_out = step_results.get(step_id, {})
                 return step_out.get(field, value)
+            else:
+                # $steps.<id> — resolve the entire step result
+                step_id = rest
+                return step_results.get(step_id, value)
         return value
     elif isinstance(value, dict):
         return {k: _resolve_refs(v, input_data, step_results) for k, v in value.items()}
