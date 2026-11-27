@@ -30,6 +30,26 @@ except ImportError:
     _TS_PARSER = None
 
 # ---------------------------------------------------------------------------
+# Helpers: timestamps and sensitive scrubbing
+# ---------------------------------------------------------------------------
+
+def _iso_now() -> str:
+    """Return ISO formatted UTC timestamp string."""
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _scrub(text: str) -> str:
+    """Scrub sensitive information such as API keys from text."""
+    if not isinstance(text, str):
+        return text
+    for key_name in ("API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"):
+        val = os.environ.get(key_name)
+        if val and len(val.strip()) > 4:
+            text = text.replace(val.strip(), "[REDACTED]")
+    return text
+
+
+# ---------------------------------------------------------------------------
 # JSON logging for validation observability
 # ---------------------------------------------------------------------------
 
@@ -41,11 +61,11 @@ def _log_validation(event: dict) -> None:
     """Append a JSON line to the validation log file for observability."""
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
     entry = {
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "timestamp": _iso_now(),
         **event,
     }
     with open(_LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
+        f.write(_scrub(json.dumps(entry)) + "\n")
 
 # Directory where all tools reside
 TOOLS_DIR = pathlib.Path(__file__).parent / "tools"
@@ -183,7 +203,7 @@ def _migrate_flat_tools(registry: dict) -> dict:
             "tags": enriched.get("tags", []),
             "permissions": enriched.get("permissions", {}),
             "healthy": True,
-            "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "created_at": _iso_now(),
         }
 
         # The version_dir is inside the old flat folder. Move it to the correct
@@ -386,28 +406,30 @@ def list_available_tools() -> list:
 def _ws_write(path: str, content: str) -> dict:
     """Write content to a file in the workspace. Path must be relative and safe."""
     try:
+        ws_resolved = WORKSPACE_DIR.resolve()
         target = (WORKSPACE_DIR / path).resolve()
-        if not str(target).startswith(str(WORKSPACE_DIR.resolve())):
+        if not (target == ws_resolved or target.is_relative_to(ws_resolved)):
             return {"error": "path_escape", "detail": f"Path '{path}' escapes workspace"}
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         return {"result": f"wrote {len(content)} bytes to {path}"}
     except Exception as e:
-        return {"error": type(e).__name__, "detail": str(e)}
+        return {"error": type(e).__name__, "detail": _scrub(str(e))}
 
 
 def _ws_list(path: str = "") -> dict:
     """List files in a workspace directory. Path must be relative and safe."""
     try:
+        ws_resolved = WORKSPACE_DIR.resolve()
         target = (WORKSPACE_DIR / path).resolve()
-        if not str(target).startswith(str(WORKSPACE_DIR.resolve())):
+        if not (target == ws_resolved or target.is_relative_to(ws_resolved)):
             return {"error": "path_escape", "detail": f"Path '{path}' escapes workspace"}
         if not target.is_dir():
             return {"error": "not_a_directory", "detail": str(target)}
         entries = [p.name for p in target.iterdir()]
         return {"result": entries}
     except Exception as e:
-        return {"error": type(e).__name__, "detail": str(e)}
+        return {"error": type(e).__name__, "detail": _scrub(str(e))}
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +438,15 @@ def _ws_list(path: str = "") -> dict:
 
 def _run_code(code: str, timeout: float = 10.0) -> dict:
     """Run a Python snippet in the sandbox with workspace as cwd.
-    Uses run_raw so plain print() output works, not just JSON."""
+    Uses run_raw so plain print() output works, not just JSON.
+    Applies static checks to prevent unauthorized operations."""
+    check = _static_check(code, manifest={"permissions": {}})
+    if not check["ok"]:
+        return {
+            "ok": False,
+            "error": "static_check_failed",
+            "detail": "; ".join(check["details"])
+        }
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
     tmp_dir = pathlib.Path(tempfile.mkdtemp())
     script = tmp_dir / "snippet.py"
@@ -507,7 +537,10 @@ def call_tool(name: str, args: dict) -> dict:
         err = _schema_error(output, manifest.get("output_schema", {}))
         if err:
             _record_failure(registry, name, active_version)
+            fallback_result = _try_fallback(registry, name, args)
             save_registry(registry)
+            if fallback_result is not None:
+                return fallback_result
             return {"error": "invalid_output", "detail": f"Output does not match output_schema: {err}"}
         # Success
         _update_stats(registry, name, success=True)
@@ -536,7 +569,7 @@ def _update_stats(registry: dict, name: str, success: bool) -> None:
         return
     stats = registry[name].get("stats", {})
     stats["calls"] = stats.get("calls", 0) + 1
-    stats["last_used"] = datetime.datetime.utcnow().isoformat() + "Z"
+    stats["last_used"] = _iso_now()
     if success:
         stats["consecutive_failures"] = 0
 
@@ -786,14 +819,59 @@ def _validate_manifest(manifest: dict, registry: dict) -> dict:
     return {"ok": len(details) == 0, "details": details}
 
 
-def _static_check(code: str, manifest: dict) -> dict:
-    """Stage 2: Static checks with tree-sitter. Returns {"ok": bool, "details": [...]}. """
+def _static_check_ast(code: str, manifest: dict) -> dict:
+    """Static checks with Python ast standard library. Returns {"ok": bool, "details": [...]}. """
+    import ast
     details = []
     permissions = manifest.get("permissions", {})
 
+    try:
+        root = ast.parse(code)
+    except SyntaxError as e:
+        return {"ok": False, "details": [f"SyntaxError in code: {e}"]}
+
+    imports = []
+    calls = []
+
+    for node in ast.walk(root):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports.append(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                imports.append(node.module)
+            for alias in node.names:
+                if alias.name in ("__import__", "importlib"):
+                    imports.append(alias.name)
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                calls.append(node.func.id)
+            elif isinstance(node.func, ast.Attribute):
+                calls.append(node.func.attr)
+
+    for mod_full in imports:
+        mod = mod_full.split(".")[0]
+        if mod in _NETWORK_MODULES and not permissions.get("network"):
+            details.append(f"Import '{mod_full}' requires permissions.network")
+        if mod in _SUBPROCESS_MODULES and not permissions.get("subprocess"):
+            details.append(f"Import '{mod_full}' requires permissions.subprocess")
+        if mod_full in ("__import__", "importlib") or mod in ("__import__", "importlib"):
+            details.append(f"Import '{mod_full}' is not allowed")
+
+    for call_name in calls:
+        if call_name == "__import__":
+            details.append("Call to __import__ is not allowed")
+
+    return {"ok": len(details) == 0, "details": details}
+
+
+def _static_check(code: str, manifest: dict) -> dict:
+    """Stage 2: Static checks. Uses tree-sitter if available, falls back to ast. Returns {"ok": bool, "details": [...]}. """
     if not HAS_TREE_SITTER:
-        details.append("tree-sitter not installed; static check skipped")
-        return {"ok": True, "details": details}
+        return _static_check_ast(code, manifest)
+
+    details = []
+    permissions = manifest.get("permissions", {})
 
     tree = _TS_PARSER.parse(bytes(code, "utf-8"))
     if tree.root_node.has_error:
@@ -842,7 +920,7 @@ def _static_check(code: str, manifest: dict) -> dict:
             details.append(f"Import '{mod_full}' requires permissions.network")
         if mod in _SUBPROCESS_MODULES and not permissions.get("subprocess"):
             details.append(f"Import '{mod_full}' requires permissions.subprocess")
-        if mod_full in ("__import__", "importlib"):
+        if mod_full in ("__import__", "importlib") or mod in ("__import__", "importlib"):
             details.append(f"Import '{mod_full}' is not allowed")
 
     # Check calls
@@ -954,9 +1032,11 @@ def _check_permission_escalation(tool_name: str, new_permissions: dict, registry
         return {"ok": True, "details": ["No active version"]}
 
     old_permissions = entry.get("versions", {}).get(active, {}).get("permissions", {})
-    new_keys = set(new_permissions.keys())
-    old_keys = set(old_permissions.keys())
-    escalated = new_keys - old_keys
+    escalated = {
+        permission
+        for permission, value in new_permissions.items()
+        if value and value != old_permissions.get(permission)
+    }
     if escalated:
         details.append(f"New permissions {escalated} require approval")
         return {"ok": False, "details": details, "needs_approval": True}
@@ -987,7 +1067,7 @@ def _promote_version(tool_name: str, version: str, code: str, manifest: dict, re
         "tags": manifest.get("tags", []),
         "permissions": manifest.get("permissions", {}),
         "healthy": True,
-        "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "created_at": _iso_now(),
     }
     entry["quarantined"] = False
 
@@ -1125,4 +1205,4 @@ def execute(name: str, args: dict) -> dict:
             return call_tool(name, args)
     except Exception as e:
         # Absolute last resort — never raise to the agent
-        return {"error": "harness_error", "detail": f"{type(e).__name__}: {e}"}
+        return {"error": "harness_error", "detail": _scrub(f"{type(e).__name__}: {e}")}

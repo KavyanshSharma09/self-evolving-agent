@@ -5,7 +5,7 @@ from openai.types.chat import ChatCompletionMessageParam
 
 load_dotenv()
 client = openai.OpenAI(api_key=os.getenv("API_KEY"), base_url=os.getenv("BASE_URL"))
-model = None
+model = os.getenv("MODEL") or None
 
 def ask(messages: list[ChatCompletionMessageParam], system: str = "You are a helpful assistant.") -> str:
     """Send the conversation to the model, return its reply as plain text."""

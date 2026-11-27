@@ -31,9 +31,17 @@ def read_task() -> str:
     return " ".join(lines)
 
 
-if __name__ == "__main__":
-    # Clean any previously created tools
-    clean_tools(exclude=set())
+def main(argv: list[str] | None = None) -> None:
+    args = sys.argv[1:] if argv is None else argv
+    if args:
+        task = " ".join(args).strip()
+        if task:
+            print(f"Running agent on: {task}\n")
+            result = run_agent(task)
+            print("\nFINAL:", result)
+            return
+
+    # Preserve learned tools across runs so the agent can reuse & evolve them
     print("Enter a task description (or type 'exit' / 'quit' to stop).")
     while True:
         try:
@@ -48,3 +56,7 @@ if __name__ == "__main__":
         print(f"\nRunning agent on: {task}\n")
         result = run_agent(task)
         print("\nFINAL:", result)
+
+
+if __name__ == "__main__":
+    main()

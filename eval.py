@@ -12,6 +12,7 @@ import json
 import pathlib
 import shutil
 import sys
+import tempfile
 
 # Ensure UTF-8 output on Windows
 if sys.platform == "win32":
@@ -29,11 +30,10 @@ def run_eval():
     print("Self-Evolving Agent Evaluation")
     print("=" * 60)
 
-    # Use a fresh codebase
-    eval_dir = pathlib.Path(__file__).parent / "eval_workspace"
-    if eval_dir.exists():
-        shutil.rmtree(eval_dir)
-    eval_dir.mkdir()
+    # Use an isolated temporary codebase without touching existing user data.
+    eval_dir = pathlib.Path(tempfile.mkdtemp(
+        prefix="eval_workspace_", dir=pathlib.Path(__file__).parent
+    ))
 
     tools_dir = eval_dir / "tools"
     tools_dir.mkdir()
